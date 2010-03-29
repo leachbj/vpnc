@@ -1204,7 +1204,7 @@ static void lifetime_ipsec_process(struct sa_block *s, struct isakmp_attribute *
 		lifetime_ipsec_process(s, a->next->next);
 }
 
-static void do_phase1_am(const char *key_id, const char *shared_key, struct sa_block *s)
+static void do_phase1_am(const char *key_id, const char *shared_key, struct sa_block *s, int re_key)
 {
 	unsigned char i_nonce[20];
 	struct group *dh_grp;
@@ -1975,16 +1975,18 @@ static void do_phase1_am(const char *key_id, const char *shared_key, struct sa_b
 		p2->isakmp_version = ISAKMP_VERSION;
 		p2->exchange_type = ISAKMP_EXCHANGE_AGGRESSIVE;
 	/* XXX CERT Add id(?), cert and sig here in case of cert auth */
-		p2->payload = new_isakmp_data_payload(ISAKMP_PAYLOAD_HASH,
+		p2->payload = pl = new_isakmp_data_payload(ISAKMP_PAYLOAD_HASH,
 			returned_hash, s->ike.md_len);
-		p2->payload->next = pl = new_isakmp_payload(ISAKMP_PAYLOAD_N);
-		pl->u.n.doi = ISAKMP_DOI_IPSEC;
-		pl->u.n.protocol = ISAKMP_IPSEC_PROTO_ISAKMP;
-		pl->u.n.type = ISAKMP_N_IPSEC_INITIAL_CONTACT;
-		pl->u.n.spi_length = 2 * ISAKMP_COOKIE_LENGTH;
-		pl->u.n.spi = xallocc(2 * ISAKMP_COOKIE_LENGTH);
-		memcpy(pl->u.n.spi + ISAKMP_COOKIE_LENGTH * 0, s->ike.i_cookie, ISAKMP_COOKIE_LENGTH);
-		memcpy(pl->u.n.spi + ISAKMP_COOKIE_LENGTH * 1, s->ike.r_cookie, ISAKMP_COOKIE_LENGTH);
+		if (!re_key) {
+			p2->payload->next = pl = new_isakmp_payload(ISAKMP_PAYLOAD_N);
+			pl->u.n.doi = ISAKMP_DOI_IPSEC;
+			pl->u.n.protocol = ISAKMP_IPSEC_PROTO_ISAKMP;
+			pl->u.n.type = ISAKMP_N_IPSEC_INITIAL_CONTACT;
+			pl->u.n.spi_length = 2 * ISAKMP_COOKIE_LENGTH;
+			pl->u.n.spi = xallocc(2 * ISAKMP_COOKIE_LENGTH);
+			memcpy(pl->u.n.spi + ISAKMP_COOKIE_LENGTH * 0, s->ike.i_cookie, ISAKMP_COOKIE_LENGTH);
+			memcpy(pl->u.n.spi + ISAKMP_COOKIE_LENGTH * 1, s->ike.r_cookie, ISAKMP_COOKIE_LENGTH);
+		}
 
 		/* send PSK-hash if hybrid authentication is negotiated */
 		if (s->ike.auth_algo == IKE_AUTH_HybridInitRSA ||
@@ -2100,7 +2102,7 @@ static void do_phase1_am(const char *key_id, const char *shared_key, struct sa_b
 	group_free(dh_grp);
 }
 
-static int do_phase2_notice_check(struct sa_block *s, struct isakmp_packet **r_p)
+static int do_phase2_notice_check(struct sa_block *s, struct isakmp_packet **r_p, int life_only)
 {
 	int reject = 0;
 	struct isakmp_packet *r;
@@ -2143,6 +2145,7 @@ static int do_phase2_notice_check(struct sa_block *s, struct isakmp_packet **r_p
 						lifetime_ipsec_process(s, r->payload->next->u.n.attributes);
 					else
 						DEBUG(2, printf("got unknown lifetime notice, ignoring..\n"));
+					if (life_only) return 0;
 					r_length = sendrecv(s, r_packet, sizeof(r_packet), NULL, 0, 0);
 					continue;
 				} else if (r->payload->next->u.n.type == ISAKMP_N_IPSEC_INITIAL_CONTACT) {
@@ -2191,7 +2194,7 @@ static int do_phase2_xauth(struct sa_block *s)
 		/* recv and check for notices */
 		if (r) free_isakmp_packet(r);
 		r = NULL;
-		reject = do_phase2_notice_check(s, &r);
+		reject = do_phase2_notice_check(s, &r, 0);
 		if (reject == -1) {
 			if (r) free_isakmp_packet(r);
 			return 1;
@@ -2364,7 +2367,7 @@ static int do_phase2_xauth(struct sa_block *s)
 			ISAKMP_EXCHANGE_MODECFG_TRANSACTION,
 			r->message_id, 0, 0, 0, 0, 0, 0, 0);
 		
-		reject = do_phase2_notice_check(s, &r);
+		reject = do_phase2_notice_check(s, &r, 0);
 		if (reject == -1) {
 			free_isakmp_packet(r);
 			return 1;
@@ -2453,7 +2456,7 @@ static int do_phase2_config(struct sa_block *s)
 
 	DEBUGTOP(2, printf("S6.2 phase2_config receive modecfg\n"));
 	/* recv and check for notices */
-	reject = do_phase2_notice_check(s, &r);
+	reject = do_phase2_notice_check(s, &r, 0);
 	if (reject == -1) {
 		if (r) free_isakmp_packet(r);
 		return 1;
@@ -2916,7 +2919,7 @@ static void send_delete_ipsec(struct sa_block *s)
 	}
 }
 
-static void send_delete_isakmp(struct sa_block *s)
+static void send_delete_isakmp_cookie(struct sa_block *s, uint8_t *i_cookie, uint8_t *r_cookie)
 {
 	DEBUGTOP(2, printf("S7.11 send isakmp termination message\n"));
 	{
@@ -2931,14 +2934,20 @@ static void send_delete_isakmp(struct sa_block *s)
 		d_isakmp->u.d.num_spi = 1;
 		d_isakmp->u.d.spi = xallocc(1 * sizeof(uint8_t *));
 		d_isakmp->u.d.spi[0] = xallocc(2 * ISAKMP_COOKIE_LENGTH);
-		memcpy(d_isakmp->u.d.spi[0] + ISAKMP_COOKIE_LENGTH * 0, s->ike.i_cookie,
+		memcpy(d_isakmp->u.d.spi[0] + ISAKMP_COOKIE_LENGTH * 0, i_cookie,
 			ISAKMP_COOKIE_LENGTH);
-		memcpy(d_isakmp->u.d.spi[0] + ISAKMP_COOKIE_LENGTH * 1, s->ike.r_cookie,
+		memcpy(d_isakmp->u.d.spi[0] + ISAKMP_COOKIE_LENGTH * 1, r_cookie,
 			ISAKMP_COOKIE_LENGTH);
 		sendrecv_phase2(s, d_isakmp, ISAKMP_EXCHANGE_INFORMATIONAL,
 			del_msgid, 1, NULL, NULL,
 			NULL, 0, NULL, 0);
 	}
+}
+
+static void send_delete_isakmp(struct sa_block *s)
+{
+	DEBUGTOP(2, printf("S7.11 send isakmp termination message\n"));
+	send_delete_isakmp_cookie(s, s->ike.i_cookie, s->ike.r_cookie);
 }
 
 static int do_rekey(struct sa_block *s, struct isakmp_packet *r)
@@ -3136,14 +3145,22 @@ static int do_rekey(struct sa_block *s, struct isakmp_packet *r)
 
 void process_late_ike(struct sa_block *s, uint8_t *r_packet, ssize_t r_length)
 {
-	int reject;
+	int reject = 0;
 	struct isakmp_packet *r;
 	struct isakmp_payload *rp;
 	
 	DEBUG(2,printf("got late ike paket: %zd bytes\n", r_length));
-	/* we should ignore resent pakets here.
-	 * unpack_verify_phase2 will fail to decode them probably */
-	reject = unpack_verify_phase2(s, r_packet, r_length, &r, NULL, 0);
+
+	if (r_length > ISAKMP_PAYLOAD_O && r_packet[ISAKMP_EXCHANGE_TYPE_O] == ISAKMP_EXCHANGE_AGGRESSIVE) {
+		DEBUG(2,printf("can't respond to phase1 aggressive... terminating\n"));
+		do_kill = -1;
+		return;
+	} else {
+		/* we should ignore resent pakets here.
+		 * unpack_verify_phase2 will fail to decode them probably */
+		DEBUG(2,printf("processing as phase2\n"));
+		reject = unpack_verify_phase2(s, r_packet, r_length, &r, NULL, 0);
+	}
 	
 	/* just ignore broken stuff for now */
 	if (reject != 0) {
@@ -3174,6 +3191,7 @@ void process_late_ike(struct sa_block *s, uint8_t *r_packet, ssize_t r_length)
 	}
 
 	if (r->exchange_type == ISAKMP_EXCHANGE_INFORMATIONAL) {
+		DEBUG(3, printf("got ISAKMP_EXCHANGE_INFORMATIONAL\n"));
 		/* Search for notify payloads */
 		for (rp = r->payload->next; rp; rp = rp->next) {
 			if (rp->type != ISAKMP_PAYLOAD_N)
@@ -3207,6 +3225,13 @@ void process_late_ike(struct sa_block *s, uint8_t *r_packet, ssize_t r_length)
 					continue;
 				}
 				DEBUG(2, printf("got r-u-there ack\n"));
+			} else if (rp->u.n.type == ISAKMP_N_IPSEC_RESPONDER_LIFETIME) {
+				if (r->payload->next->u.n.protocol == ISAKMP_IPSEC_PROTO_ISAKMP)
+					lifetime_ike_process(s, r->payload->next->u.n.attributes);
+				else if (r->payload->next->u.n.protocol == ISAKMP_IPSEC_PROTO_IPSEC_ESP)
+					lifetime_ipsec_process(s, r->payload->next->u.n.attributes);
+				else
+					DEBUG(2, printf("got unknown lifetime notice, ignoring..\n"));
 			}
 		}
 	}
@@ -3288,7 +3313,7 @@ int main(int argc, char **argv)
 	do_load_balance = 0;
 	do {
 		DEBUGTOP(2, printf("S4 do_phase1_am\n"));
-		do_phase1_am(config[CONFIG_IPSEC_ID], config[CONFIG_IPSEC_SECRET], s);
+		do_phase1_am(config[CONFIG_IPSEC_ID], config[CONFIG_IPSEC_SECRET], s, 0);
 		DEBUGTOP(2, printf("S5 do_phase2_xauth\n"));
 		/* FIXME: Create and use a generic function in supp.[hc] */
 		if (s->ike.auth_algo >= IKE_AUTH_HybridInitRSA)
@@ -3318,3 +3343,26 @@ int main(int argc, char **argv)
 
 	return 0;
 }
+
+void rekey_phase1(struct sa_block *s) {
+	struct isakmp_packet *r;
+	uint8_t i_cookie[ISAKMP_COOKIE_LENGTH], r_cookie[ISAKMP_COOKIE_LENGTH];
+
+	memcpy(i_cookie, s->ike.i_cookie, ISAKMP_COOKIE_LENGTH);
+	memcpy(r_cookie, s->ike.r_cookie, ISAKMP_COOKIE_LENGTH);
+
+	do_phase1_am(config[CONFIG_IPSEC_ID], config[CONFIG_IPSEC_SECRET], s, 1);
+
+	(void)do_phase2_xauth(s);
+
+	DEBUG(3, printf("notice_checks\n"));
+	r_length = sendrecv(s, r_packet, sizeof(r_packet), NULL, 0, 0);
+	do_phase2_notice_check(s, &r, 1);
+	if (r) free_isakmp_packet(r);
+	DEBUG(3, printf("notice_checks done\n"));
+
+	/* delete the old SA and read the response */
+	DEBUG(3, printf("delete old cookie\n"));
+	send_delete_isakmp_cookie(s, i_cookie, r_cookie);
+}
+

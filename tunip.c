@@ -880,12 +880,14 @@ static void vpnc_main_loop(struct sa_block *s)
 					}
 				}
 			}
-			DEBUG(2,printf("lifetime status: %ld of %u seconds used, %u|%u of %u kbytes used\n",
+			DEBUG(2,printf("lifetime status: %ld of %u seconds used, %u|%u of %u kbytes used, ike: %ld of %u seconds used\n",
 				time(NULL) - s->ipsec.life.start,
 				s->ipsec.life.seconds,
 				s->ipsec.life.rx/1024,
 				s->ipsec.life.tx/1024,
-				s->ipsec.life.kbytes));
+				s->ipsec.life.kbytes,
+				time(NULL) - s->ike.life.start,
+				s->ike.life.seconds));
 		} while ((presult == 0 || (presult == -1 && errno == EINTR)) && !do_kill);
 		if (presult == -1) {
 			syslog(LOG_ERR, "select: %m");
@@ -911,6 +913,12 @@ static void vpnc_main_loop(struct sa_block *s)
 		if (timed_mode) {
 			time_t now = time(NULL);
 			time_t next_up = now + 86400;
+
+			if ((now - s->ike.life.start) + ((s->ike.life.seconds*20)/100) > s->ike.life.seconds) {
+				DEBUG(3,printf("starting phase1 rekey\n"));
+				rekey_phase1(s);
+			}
+
 			if (enable_keepalives) {
 				/* never wait more than 9 seconds for a UDP keepalive */
 				next_up = now + 9;
