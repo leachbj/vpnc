@@ -98,7 +98,7 @@ struct sa_block {
 		time_t dpd_sent;
 		unsigned int dpd_attempts;
 	} ike;
-	uint8_t our_address[4], our_netmask[4];
+	struct in_addr our_address, our_netmask;
 	struct {
 		int do_pfs;
 		int cry_algo, md_algo;
